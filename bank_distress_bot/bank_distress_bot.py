@@ -79,7 +79,6 @@ def pct(x: float) -> str:
 
 
 def assess(rec: dict) -> dict:
-    """Score one customer record. Deterministic and explainable."""
     C = CONFIG
     bal, after = rec["Account Balance"], rec["Account Balance After Transaction"]
     limit, ccb, min_due = rec["Credit Limit"], rec["Credit Card Balance"], rec["Minimum Payment Due"]
@@ -142,7 +141,6 @@ def assess(rec: dict) -> dict:
 
 
 def read_dataframe(csv_path: str) -> pd.DataFrame:
-    """Read the bank CSV and parse its date columns."""
     df = pd.read_csv(csv_path)
     for c in DATE_COLS:
         df[c] = pd.to_datetime(df[c])
@@ -166,7 +164,6 @@ POSITIVE_STATUSES = ("EARLY WARNING", "FINANCIAL DISTRESS")
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Raw bank table -> purely numeric feature matrix (no demographics, no IDs)."""
     X = df[NUMERIC_FEATURES].astype(float).copy()
     pos = lambda col: df[col].where(df[col] > 0)
     X["utilisation"] = (df["Credit Card Balance"] / pos("Credit Limit")).fillna(0.0)
@@ -180,7 +177,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_labels(df: pd.DataFrame) -> pd.Series:
-    """Label = 1 if the rule engine flags the customer (EARLY WARNING or worse)."""
     return pd.Series([int(assess(r)["status"] in POSITIVE_STATUSES) for r in df.to_dict("records")],
                      index=df.index, name="flagged")
 
@@ -197,13 +193,6 @@ def _clean(X) -> np.ndarray:
 
 
 class TorchMLPClassifier(*_SK_BASES):
-    """PyTorch feed-forward network with the scikit-learn fit / predict_proba interface.
-
-    [Linear -> BatchNorm -> SiLU -> Dropout] x len(hidden) -> Linear(1); AdamW on class-weighted BCE, LR scheduler and
-    early stopping on an internal validation split. Inputs are signed-log-compressed (money columns) and standardised
-    inside the model. torch is imported lazily so the bot starts without it unless a deep model file is loaded.
-    """
-
     def __init__(self, hidden=(128, 64, 32), dropout=0.15, lr=2e-3, weight_decay=1e-4, batch_size=256,
                  max_epochs=150, patience=15, val_fraction=0.1, random_state=42, verbose=False):
         self.hidden, self.dropout, self.lr, self.weight_decay = hidden, dropout, lr, weight_decay
@@ -305,8 +294,6 @@ class TorchMLPClassifier(*_SK_BASES):
 
 
 class ModelAdvisor:
-    """Optional statistical 'second opinion'. Informational only: it never changes a flag or a score."""
-
     def __init__(self, bundle: dict):
         self.model, self.columns = bundle["model"], bundle["feature_columns"]
         self.threshold, self.meta = bundle.get("threshold", 0.5), bundle.get("meta", {})
@@ -346,8 +333,6 @@ def now() -> datetime:
 
 
 class Store:
-    """SQLite: data snapshots (for trends), flag reviews, audit log."""
-
     def __init__(self, path: str):
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.executescript(SCHEMA)
@@ -425,7 +410,6 @@ ROUTER_SYSTEM = (
 
 
 def parse_router_reply(text: str):
-    """Extract (index, customer_id) from the model's reply; (None, None) if unusable."""
     m = re.search(r"\{.*\}", text or "", re.S)
     try:
         d = json.loads(m.group(0)) if m else {}
@@ -466,7 +450,6 @@ class GeminiRouter:
 
 
 def make_router():
-    """A GeminiRouter if GEMINI_API_KEY is set in .env; otherwise None (offline rules only)."""
     key = os.getenv("GEMINI_API_KEY", "").strip()
     if not key or key.lower().startswith("your-"):
         return None
@@ -533,7 +516,6 @@ class Bot:
         return Session(employee_id)
 
     def rewrite(self, raw: str):
-        """Ask the router which supported command was meant; return canonical text or None."""
         idx, cid = self.router.route(raw)
         if idx is None:
             return None
@@ -556,7 +538,6 @@ class Bot:
         return next(((codes, title) for pat, codes, title in FILTERS if re.search(pat, t)), None)
 
     def parse(self, raw: str, t: str):
-        """Return (intent, params): rule-based routing for the supported questions."""
         has = lambda pat: re.search(pat, t)
         p: dict = {}
         if re.fullmatch(r"(help|hi|hello|hey|\?|what can you do\??|menu)", t):
@@ -606,7 +587,6 @@ class Bot:
         return f"Customer {cid} was not found. Customer IDs in this database run from {min(self.a)} to {max(self.a)}."
 
     def _review_state(self, a):
-        """(review, suppressed?) for a customer."""
         r = self.store.latest_review(a["id"])
         if not r:
             return None, False
@@ -667,7 +647,6 @@ class Bot:
         return "\n".join(out) + self._review_note(a)
 
     def _model_note(self, a) -> list[str]:
-        """Informational statistical estimate; never part of the score or status."""
         if not self.advisor or a["id"] not in self.advisor.proba:
             return []
         p = self.advisor.proba[a["id"]]
@@ -712,7 +691,6 @@ class Bot:
                 "vulnerable-customer procedures.")
 
     def compare(self, cid, mode):
-        """Trend / changes between the last two data snapshots (or an honest note if there is only one)."""
         a, hist = self.a[cid], self.store.history(cid)
         title = "Trend" if mode == "trend" else "Changes"
         if len(hist) >= 2:
@@ -912,7 +890,6 @@ class Bot:
 
 
 def resolve_path(p: str) -> Path:
-    """Relative paths are looked up in the current folder first, then next to this script."""
     path = Path(p).expanduser()
     return path if path.is_absolute() or path.exists() else BASE_DIR / path
 
@@ -927,8 +904,6 @@ def parse_args(description: str):
 
 
 class Backend:
-    """Loads the data, rules, optional ML advisor and Gemini router, and answers questions. No UI code."""
-
     def __init__(self, csv: str, db: str, model: str, employee: str | None = None):
         csv_path = resolve_path(csv)
         if not csv_path.exists():
@@ -936,7 +911,7 @@ class Backend:
         self.csv_name = csv_path.name
         self.df = read_dataframe(str(csv_path))
         self.assessments = assess_all(self.df)
-        self.store = Store(str(resolve_path(db)))
+        self.store = Store(db if db == ":memory:" else str(resolve_path(db)))
         self.new_snapshot = self.store.record_snapshot(csv_path.name, file_digest(str(csv_path)), self.assessments)
         model_path = resolve_path(model)
         self.advisor = ModelAdvisor.load(model_path) if model_path.exists() else None
@@ -956,7 +931,6 @@ class Backend:
             return f"Sorry, something went wrong ({type(e).__name__}: {e})."
 
     def flagged_rows(self, distress_only: bool = False) -> list[tuple]:
-        """(id, name, status, score, signals, ML estimate) for every active flag, highest score first."""
         rows = []
         for a in self.assessments.values():
             if not self.bot._is_active_flag(a) or (distress_only and a["status"] != "FINANCIAL DISTRESS"):
@@ -981,7 +955,6 @@ class Backend:
 
 
 def load_backend(description: str) -> Backend:
-    """Parse the command line and build the Backend (exits with a clear message if the data is missing)."""
     args = parse_args(description)
     try:
         return Backend(args.csv, args.db, args.model, args.employee)
@@ -990,7 +963,7 @@ def load_backend(description: str) -> Backend:
 
 
 def main() -> None:
-    be = load_backend("Financial-Distress Early-Warning Assistant (terminal chat). For the window, run gui.py.")
+    be = load_backend("Financial-Distress Early-Warning Assistant (terminal chat). For the browser version, run web_app.py.")
     print(be.banner())
     print("Type 'help' for examples, 'quit' to exit.\n")
     while True:
