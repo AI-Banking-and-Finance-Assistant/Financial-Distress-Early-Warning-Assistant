@@ -13,7 +13,6 @@ from bank_distress_bot import (BASE_DIR, DEFAULT_CSV, DEFAULT_MODEL, POSITIVE_ST
 
 
 def predict_dataframe(df: pd.DataFrame, advisor: ModelAdvisor, split: dict | None = None) -> pd.DataFrame:
-    """One prediction row per customer in df, highest probability first."""
     proba = advisor.predict(df)
     rules = [assess(r) for r in df.to_dict("records")]
     out = pd.DataFrame({"Customer ID": df["Customer ID"].astype(int).to_numpy(),
@@ -45,8 +44,8 @@ def main() -> int:
     data = Path(a.data) if Path(a.data).exists() else BASE_DIR / a.data
     if not data.exists():
         sys.exit(f"Data file not found: {data}")
-    if not (a.customer or a.all or a.data != DEFAULT_CSV):
-        sys.exit("Choose what to predict: --customer ID [ID ...], --all, or --data FILE.csv")
+    if not (a.customer or a.all or a.top or a.data != DEFAULT_CSV):
+        sys.exit("Choose what to predict: --customer ID [ID ...], --all, --top N, or --data FILE.csv")
 
     advisor = ModelAdvisor.load(model_path)
     if advisor is None:
