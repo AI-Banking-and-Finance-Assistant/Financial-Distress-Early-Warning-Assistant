@@ -38,7 +38,6 @@ def candidates(seed: int, epochs: int = 150) -> dict:
 
 
 def best_threshold(y: np.ndarray, proba: np.ndarray) -> float:
-    """Threshold maximising F1 on cross-validated TRAIN predictions."""
     p, r, t = precision_recall_curve(y, proba)
     return float(t[np.argmax(2 * p[:-1] * r[:-1] / np.clip(p[:-1] + r[:-1], 1e-12, None))])
 
@@ -56,9 +55,13 @@ def main() -> int:
 
     try:
         import torch
+        torch.manual_seed(a.seed)
     except ImportError:
-        sys.exit("PyTorch is required. Install it with: pip install -r requirements.txt")
-    torch.manual_seed(a.seed)
+        torch = None
+        if not a.allow_classical:
+            sys.exit("PyTorch is required for the deep-learning models. Install it with: pip install -r requirements.txt\n"
+                     "(or add --allow-classical to train the classical models only)")
+        print("PyTorch is not installed - training the classical models only.")
 
     data = Path(a.data) if Path(a.data).exists() else BASE_DIR / a.data
     if not data.exists():
@@ -85,6 +88,8 @@ def main() -> int:
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=a.seed)
     scores, cv_proba = {}, {}
     for name, m in candidates(a.seed, a.max_epochs).items():
+        if torch is None and name in DEEP:
+            continue
         cv_proba[name] = cross_val_predict(m, X_tr, y_tr, cv=cv, method="predict_proba")[:, 1]
         scores[name] = float(average_precision_score(y_tr, cv_proba[name]))
         print(f"  CV average precision  {name:<24s} {scores[name]:.4f}   [{'deep' if name in DEEP else 'baseline'}]")
@@ -103,13 +108,21 @@ def main() -> int:
         trained_at=datetime.now().isoformat(timespec="seconds"), model_name=best, label_source=source,
         sklearn_version=sklearn.__version__, data_file=data.name, data_sha256=sha, seed=a.seed, test_size=a.test_size,
         cv_average_precision=scores, model_family="deep learning (PyTorch)" if best in DEEP else "classical",
-        torch_version=torch.__version__, epochs_trained=getattr(model, "n_epochs_", None),
+        torch_version=torch.__version__ if torch else None, epochs_trained=getattr(model, "n_epochs_", None),
         n_train=len(X_tr), n_test=len(X_te))), out)
     (out.parent / "split.json").write_text(json.dumps(dict(
         seed=a.seed, label_source=source, data_sha256=sha,
         train_ids=sorted(map(int, id_tr)), test_ids=sorted(map(int, id_te)))))
     if a.outcomes:
         y.rename("label").to_frame().assign(**{"Customer ID": ids}).to_csv(out.parent / "labels.csv", index=False)
+    reports = BASE_DIR / "reports"
+    reports.mkdir(exist_ok=True)
+    (reports / "training_summary.json").write_text(json.dumps(dict(
+        selected_model=best, model_family="deep learning (PyTorch)" if best in DEEP else "classical",
+        decision_threshold=round(threshold, 4), cv_average_precision={k: round(v, 4) for k, v in scores.items()},
+        epochs_trained=getattr(model, "n_epochs_", None), n_features=int(X.shape[1]), n_train=len(X_tr), n_test=len(X_te),
+        positives=int(y.sum()), label_source=source), indent=2))
+    print(f"Saved training summary -> {reports / 'training_summary.json'}")
     print(f"Saved model -> {out}\nSaved split -> {out.parent / 'split.json'}\nNext: python test_distress.py")
     return 0
 
