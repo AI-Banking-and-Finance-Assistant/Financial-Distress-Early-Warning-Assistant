@@ -5,14 +5,20 @@ import json
 import pickle
 import re
 import sys
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from datetime import timedelta
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from bank_distress_bot import (BASE_DIR, DEFAULT_CSV, DEFAULT_MODEL, Bot, Store, TorchMLPClassifier, assess,
+import nlp_intent
+import time_series as ts
+from bank_distress_bot import (BASE_DIR, CANONICAL, DEFAULT_CSV, DEFAULT_MODEL, Bot, Store, TorchMLPClassifier, assess,
                                build_features, file_digest, make_labels, parse_router_reply, read_dataframe)
 
 try:
@@ -28,7 +34,6 @@ DATA = BASE_DIR / DEFAULT_CSV
 
 
 def record(**kw) -> dict:
-    """A healthy baseline customer record; override fields to create scenarios."""
     base = {"Customer ID": 1, "First Name": "Test", "Last Name": "User", "Contact Number": 12345678901,
             "Email": "t@example.com", "Address": "1 Main St", "City": "Town", "Anomaly": 1,
             BAL: 5000.0, BAL_AFTER: 5200.0, "Transaction Type": "Deposit", "Transaction Amount": 200.0,
@@ -186,6 +191,108 @@ class TestDeepLearningModel(unittest.TestCase):
         self.assertFalse(hasattr(c, "state_"))
 
 
+class TestTimeSeries(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.df = read_dataframe(str(DATA)).head(1500)
+        cls.cf = ts.customer_frame(cls.df)
+        cls.daily = ts.daily_series(cls.cf)
+
+    def test_daily_counts_add_up(self):
+        self.assertEqual(int(self.daily["customers"].sum()), len(self.df))
+        self.assertTrue((self.daily["flagged"] <= self.daily["customers"]).all())
+
+    def test_weekly_blocks_are_complete(self):
+        w = ts.weekly_series(self.daily)
+        self.assertTrue((w["days"] == 7).all())
+        self.assertTrue(w["flag_rate"].between(0, 1).all())
+
+    def test_decomposition_reconstructs_series(self):
+        y = pd.Series(np.sin(np.arange(70) * 2 * np.pi / 7) + np.arange(70) * 0.1)
+        d = ts.decompose(y, 7).dropna()
+        np.testing.assert_allclose((d.trend + d.seasonal + d.residual).to_numpy(), d.observed.to_numpy(), atol=1e-9)
+
+    def test_acf_lag_zero_is_one(self):
+        self.assertAlmostEqual(ts.acf(np.random.RandomState(0).randn(100), 5)[0], 1.0)
+
+    def test_holt_follows_a_straight_line(self):
+        y = np.arange(30, dtype=float) * 2 + 5
+        np.testing.assert_allclose(ts.f_holt(y, 3), [65, 67, 69], atol=0.5)
+
+    def test_metrics_and_comparison(self):
+        m = ts.metrics(np.array([1.0, 2.0]), np.array([1.0, 4.0]))
+        self.assertAlmostEqual(m["MAE"], 1.0)
+        t = ts.compare_models(np.random.RandomState(1).rand(40), 6)
+        self.assertGreaterEqual(len(t), 4)
+        self.assertEqual(list(t["RMSE"]), sorted(t["RMSE"]))
+
+
+class TestNLP(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        X, y = nlp_intent.make_dataset(0)
+        cls.model = nlp_intent.build_pipeline().fit([nlp_intent.normalise(s) for s in X], y)
+
+    def test_every_intent_has_phrases_and_valid_index(self):
+        self.assertTrue(all(0 <= i < len(CANONICAL) and p for i, p in nlp_intent.PHRASES.items()))
+        self.assertEqual(set(nlp_intent.PHRASES), set(range(len(CANONICAL))))
+
+    def test_clear_questions_are_classified(self):
+        for text, expected in [("who paid late", 4), ("how does flagging work", 13), ("why was customer 12 flagged", 1)]:
+            self.assertEqual(nlp_intent.classify(self.model, text)[0], expected)
+
+    def test_customer_id_is_extracted(self):
+        self.assertEqual(nlp_intent.classify(self.model, "check customer 4312")[2], 4312)
+
+    def test_nonsense_is_rejected(self):
+        self.assertIsNone(nlp_intent.classify(self.model, "what's the weather like in Paris")[0])
+
+
+class TestWebApp(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import web_app
+        from bank_distress_bot import Backend
+        cls.be = Backend(DEFAULT_CSV, ":memory:", "models/does_not_exist.joblib", "E1234")
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), web_app.make_handler(web_app.App(cls.be)))
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def post(self, body, ctype="application/json", host=None):
+        h = {"Content-Type": ctype, **({"Host": host} if host else {})}
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/ask", data=body, headers=h)
+        return urllib.request.urlopen(req)
+
+    def test_chat_round_trip(self):
+        r = json.loads(self.post(json.dumps({"text": "How does flagging work?"}).encode()).read())
+        self.assertIn("reply", r)
+
+    def test_rejects_non_json_and_foreign_host(self):
+        with self.assertRaises(urllib.error.HTTPError) as c:
+            self.post(b"text=hi", ctype="text/plain")
+        self.assertEqual(c.exception.code, 415)
+        with self.assertRaises(urllib.error.HTTPError) as c:
+            self.post(json.dumps({"text": "hi"}).encode(), host="evil.example.com")
+        self.assertEqual(c.exception.code, 403)
+
+    def test_page_served(self):
+        self.assertIn(b"Early-Warning", urllib.request.urlopen(f"http://127.0.0.1:{self.port}/").read())
+
+    def test_clear_resets_conversation_but_keeps_employee(self):
+        self.be.session.employee_id = "E1234"
+        self.post(json.dumps({"text": "Check customer 1"}).encode())
+        self.assertIsNotNone(self.be.session.last_customer)
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/clear", data=b"{}",
+                                     headers={"Content-Type": "application/json"})
+        self.assertTrue(json.loads(urllib.request.urlopen(req).read())["ok"])
+        self.assertIsNone(self.be.session.last_customer)
+        self.assertEqual(self.be.session.employee_id, "E1234")
+
+
 def evaluate_model(data_path: Path, model_path: Path, out_dir: Path) -> dict:
     import joblib
     import matplotlib
@@ -266,7 +373,8 @@ def main() -> int:
     model_path = Path(a.model) if Path(a.model).is_absolute() else BASE_DIR / a.model
 
     load = unittest.defaultTestLoader.loadTestsFromTestCase
-    suite = unittest.TestSuite(load(c) for c in (TestScoring, TestFeaturesAndRouter, TestBotWorkflow, TestDeepLearningModel))
+    suite = unittest.TestSuite(load(c) for c in (TestScoring, TestFeaturesAndRouter, TestBotWorkflow, TestDeepLearningModel,
+                                                           TestTimeSeries, TestNLP, TestWebApp))
     if not a.skip_model:
         if not model_path.exists():
             print(f"No trained model at {model_path} - run `python train_model.py` first (or use --skip-model).")
