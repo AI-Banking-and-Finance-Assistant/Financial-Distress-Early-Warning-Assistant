@@ -1,16 +1,3 @@
-"""Time series analysis on the banking data (rubric: Time Series Analysis on Data).
-
-The database holds one 2023 transaction per customer, so the time axis is `Transaction Date`. Each customer is scored by
-the rule engine and the results are aggregated per day / week:
-  1. descriptive series  - customers flagged, flag rate, average risk score, average balance, transaction volume
-  2. decomposition       - trend + weekday seasonality + residual (classical additive method)
-  3. autocorrelation     - is the weekly flag rate predictable from its own past?
-  4. forecasting         - naive / mean / moving-average / Holt linear (+ ARIMA if statsmodels is installed),
-                           compared on a held-out final stretch with MAE, RMSE and MAPE
-  5. snapshots           - if the SQLite store holds two or more data extracts, flags are compared across snapshots
-
-Run:  python time_series.py            (add --holdout 8 --horizon 8 --db distress_bot.db)
-"""
 from __future__ import annotations
 
 import argparse
@@ -27,9 +14,7 @@ import matplotlib.pyplot as plt
 from bank_distress_bot import BASE_DIR, DEFAULT_CSV, POSITIVE_STATUSES, assess_all, read_dataframe, resolve_path
 
 
-# ---------------------------------------------------------------- series construction
 def customer_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per customer with the rule-engine result attached, indexed by transaction date."""
     a = assess_all(df)
     out = pd.DataFrame({"date": df["Transaction Date"].dt.normalize(),
                         "flagged": [int(a[int(i)]["status"] in POSITIVE_STATUSES) for i in df["Customer ID"]],
@@ -51,7 +36,6 @@ def daily_series(cf: pd.DataFrame) -> pd.DataFrame:
 
 
 def weekly_series(daily: pd.DataFrame) -> pd.DataFrame:
-    """Consecutive 7-day blocks from the first date; an incomplete last block is dropped."""
     block = (np.arange(len(daily)) // 7)
     g = daily.assign(block=block).groupby("block")
     w = pd.DataFrame({"start": g.apply(lambda x: x.index[0], include_groups=False), "days": g.size(),
@@ -64,9 +48,7 @@ def weekly_series(daily: pd.DataFrame) -> pd.DataFrame:
     return w[w["days"] == 7].set_index("start")
 
 
-# ---------------------------------------------------------------- decomposition and autocorrelation
 def decompose(y: pd.Series, period: int = 7) -> pd.DataFrame:
-    """Classical additive decomposition: centred moving-average trend, mean seasonal profile, residual."""
     trend = y.rolling(period, center=True, min_periods=period).mean()
     detr = y - trend
     prof = detr.groupby(np.arange(len(y)) % period).mean()
@@ -80,7 +62,6 @@ def acf(y: np.ndarray, nlags: int = 12) -> np.ndarray:
     return np.array([np.dot(y[:len(y) - k], y[k:]) / d for k in range(nlags + 1)])
 
 
-# ---------------------------------------------------------------- forecasting models (numpy only)
 def f_naive(train: np.ndarray, h: int) -> np.ndarray:
     return np.repeat(train[-1], h)
 
@@ -94,7 +75,6 @@ def f_moving_average(train: np.ndarray, h: int, window: int = 4) -> np.ndarray:
 
 
 def holt_fit(train: np.ndarray) -> tuple[float, float, float, float]:
-    """Grid-search Holt's linear method on one-step-ahead squared error. Returns (alpha, beta, level, trend)."""
     best = (np.inf, 0.5, 0.1, train[0], 0.0)
     for al in np.linspace(0.05, 0.95, 19):
         for be in np.linspace(0.01, 0.5, 10):
@@ -145,7 +125,6 @@ def compare_models(y: np.ndarray, holdout: int) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("RMSE").reset_index(drop=True)
 
 
-# ---------------------------------------------------------------- snapshots (optional)
 def snapshot_history(db_path: str) -> pd.DataFrame:
     path = resolve_path(db_path)
     if not path.exists():
@@ -185,7 +164,6 @@ def main() -> int:
     print(f"Daily points: {len(daily)} | complete weeks: {len(weekly)} | mean weekly flag rate {y.mean():.1%} "
           f"(sd {y.std(ddof=1):.1%})")
 
-    # 1. descriptive plots
     fig, ax = plt.subplots(2, 2, figsize=(14, 8))
     weekly["flagged"].plot(ax=ax[0, 0], marker="o", color="#d62728", label="flagged"); weekly["distress"].plot(
         ax=ax[0, 0], marker="s", color="#7f0000", label="distress"); ax[0, 0].set_title("Customers flagged per week"); ax[0, 0].legend()
@@ -194,7 +172,6 @@ def main() -> int:
     weekly["volume"].plot(ax=ax[1, 1], color="#2ca02c"); ax[1, 1].set_title("Total transaction volume per week")
     fig.tight_layout(); fig.savefig(out_dir / "ts_overview.png", dpi=130); plt.close(fig)
 
-    # 2. decomposition of the daily number of flagged customers (weekday seasonality)
     dec = decompose(daily["flagged"].astype(float), 7)
     fig, ax = plt.subplots(4, 1, figsize=(12, 9), sharex=True)
     for x, c in zip(ax, dec.columns):
@@ -203,7 +180,6 @@ def main() -> int:
     fig.tight_layout(); fig.savefig(out_dir / "ts_decomposition.png", dpi=130); plt.close(fig)
     seasonal_share = float(dec["seasonal"].var() / dec["observed"].var())
 
-    # 3. autocorrelation of the weekly flag rate
     ac, band = acf(y, 12), 1.96 / np.sqrt(len(y))
     fig, x = plt.subplots(figsize=(8, 4))
     x.bar(range(len(ac)), ac); x.axhline(band, ls="--", c="grey"); x.axhline(-band, ls="--", c="grey")
@@ -211,7 +187,6 @@ def main() -> int:
     fig.tight_layout(); fig.savefig(out_dir / "ts_acf.png", dpi=130); plt.close(fig)
     significant = [int(k) for k in range(1, len(ac)) if abs(ac[k]) > band]
 
-    # 4. forecasting comparison on the held-out weeks
     table = compare_models(y, a.holdout)
     print("\nForecast comparison on the last", a.holdout, "weeks (weekly flag rate):")
     print(table.assign(MAE=lambda d: d.MAE * 100, RMSE=lambda d: d.RMSE * 100).round(2).to_string(index=False))
@@ -227,7 +202,6 @@ def main() -> int:
     x.axvline(weekly.index[-a.holdout], ls=":", c="grey"); x.set_title("Weekly flag rate with forecast"); x.legend()
     fig.tight_layout(); fig.savefig(out_dir / "ts_forecast.png", dpi=130); plt.close(fig)
 
-    # 5. snapshots
     snaps = snapshot_history(a.db)
     if len(snaps) >= 2:
         print("\nSnapshots in the audit database:\n" + snaps.to_string(index=False))
@@ -246,4 +220,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
